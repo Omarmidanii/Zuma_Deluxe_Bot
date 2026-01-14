@@ -1,7 +1,7 @@
 import cv2 as cv
 import numpy as np
 
-img = cv.imread("assets/templates/anchor.png")
+img = cv.imread("assets/templates/image.png")
 hsv = cv.cvtColor(img, cv.COLOR_BGR2HSV)
 
 def on_mouse(event, x, y, flags, param):

@@ -14,10 +14,11 @@ COLOR_PROTOTYPES = {
     "yellow":  30,
     "green":   70,
     "purple": 150,
+    "orange": 10
 }
 
 # Classification thresholds
-HUE_WINDOW = 15           # degrees each side
+HUE_WINDOW = 10           # degrees each side
 SAT_THRESH = 60
 VAL_THRESH = 60
 PROPORTION_THRESH = 0.45

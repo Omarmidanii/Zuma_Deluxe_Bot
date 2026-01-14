@@ -1,30 +1,3 @@
-"""captureWindow_win.py (NO-SWAP edition)
-
-Stronger Zuma auto-player built on top of your existing pipeline:
-  - ORB anchor -> ROI capture
-  - HoughCircles + HSV classification -> ball list
-  - Shooter-ball detection -> current/back balls near center
-
-Main improvements vs your original captureWindow.py:
-  1) **Never target shooter balls**.
-     Your old ray-caster could "hit" the current mouth-ball because it's the
-     closest circle in many directions.
-  2) **Cluster size is computed per-color**, and only along likely chain-neighbors.
-     In Zuma, popping requires 3+ adjacent balls of the same color.
-  3) **Decision policy** (simple but much better than nearest-ball):
-       - POP NOW: shoot current color into a visible same-color cluster (size>=2)
-       - SETUP: if current==next, grow a lone ball into a pair for the next shot
-       - NEXT POP SOON: if next ball has an immediate POP, "dump" current safely
-       - DUMP: if nothing good, throw into empty space / least-bad ray
-
-Important: You said your version has **no ball swap**, so this file contains
-**ZERO right-click swap logic**.
-
-This still won't beat every single level (special balls, occlusions, weird
-geometry, etc.), but it fixes the biggest logic problems in your current bot and
-should play significantly better out of the box.
-"""
-
 from __future__ import annotations
 
 import math
@@ -37,70 +10,32 @@ import cv2
 import numpy as np
 import mss
 
-from window.feature_window_detector import FeatureWindowDetector
+# from window.feature_window_detector import FeatureWindowDetector
+from window.multi_level_window_detector import MultiLevelWindowDetector
 import window.detect_balls as wd
 import window.detect_shooter as shooter
 import window.aim_overlay as aim
 
 
-# ===========================
-# UI Windows
-# ===========================
 ROI_WINDOW = "Zuma ROI + Balls"
 ANCHOR_WINDOW = "Zuma Anchor Debug"
-
-
-# ===========================
-# Debug toggles
-# ===========================
 DRAW_RAYS = False
 HIGHLIGHT_CHOSEN = True
 SHOW_ANCHOR_DEBUG = True
-
-
-# ===========================
-# Performance knobs
-# ===========================
 TARGET_FPS = 30
 ANCHOR_EVERY_N = 12
 BALL_EVERY_N = 2
 BBOX_PAD = 12
 USE_RIGHT_HALF = True
-
-
-# ===========================
-# Auto-play knobs
-# ===========================
 AUTO_PLAY = True
-
-# Your old 2.0s cooldown is extremely slow for Zuma-like games.
 SHOT_COOLDOWN_SEC = 0.40
-
-# Angle sampling for ray visibility (smaller = smarter, slower).
-RAY_STEP_DEG = 10
-
-# Require the same plan a couple frames in a row before clicking.
+RAY_STEP_DEG = 8
 TARGET_STABLE_FRAMES = 2
-
-
-# ===========================
-# Geometry heuristics
-# ===========================
-
-# Exclude balls near center (frog area) from *targets*.
 EXCLUDE_CENTER_REL = getattr(shooter, "SHOOTER_MAX_DIST_REL", 0.24)
-
-# How close two balls must be to be considered *chain neighbors*.
-# (We restrict to ~2 nearest neighbors per ball to avoid merging across curves.)
 NEIGHBOR_LINK_FACTOR = 1.28
-
-# For same-color groups, we keep it a bit tighter to avoid spanning gaps.
 SAME_COLOR_LINK_FACTOR = 1.18
 
 
-# ===========================
-# Mouse helpers (Windows)
-# ===========================
 def _init_dpi_awareness() -> None:
     try:
         ctypes.windll.user32.SetProcessDPIAware()
@@ -126,9 +61,6 @@ def click_at_screen(x: float, y: float) -> None:
     _user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
 
-# ===========================
-# Small drawing helpers
-# ===========================
 def highlight_target_ball(img: np.ndarray, target: Optional[dict], label: str = "TARGET") -> np.ndarray:
     if target is None:
         return img
@@ -199,11 +131,6 @@ def draw_rays_from_origin(img: np.ndarray, origin_ball: dict, step_deg: int = 5,
         cv2.line(out, (int(cx), int(cy)), (ex, ey), (255, 255, 255), thickness, cv2.LINE_AA)
 
     return out
-
-
-# ===========================
-# Ball grouping / visibility
-# ===========================
 
 
 class _DSU:
@@ -485,6 +412,26 @@ def plan_best_shot(
     neighbor_edges = compute_chain_neighbor_edges(track_balls)
     cluster_sizes = compute_same_color_cluster_sizes(track_balls, neighbor_edges=neighbor_edges)
 
+    def aim_xy_for_hit(hit: dict) -> Tuple[float, float]:
+        """Click along the SAME angle that produced this first-hit."""
+        ang = float(hit["angle"])
+        rad = math.radians(ang)
+        dx = math.cos(rad)
+        dy = -math.sin(rad)  # y axis points downward in image coords
+
+        ox = float(origin_ball["x"])
+        oy = float(origin_ball["y"])
+
+        ex, ey = _ray_end_at_border(ox, oy, dx, dy, w, h)
+
+        # optional safety margin so we don't click exactly on the border pixels
+        M = 3
+        ex = max(M, min(w - 1 - M, ex))
+        ey = max(M, min(h - 1 - M, ey))
+
+        return float(ex), float(ey)
+
+    
     def score_pop(hit: dict) -> float:
         b = hit["ball"]
         sz = float(cluster_sizes.get(id(b), 1))
@@ -520,38 +467,38 @@ def plan_best_shot(
                 target_key=_ball_key(b),
             )
 
-    # 2) SETUP: if current==next, grow a single into a pair for the next shot
-    # (You shoot curr into a lone same-color ball => pair; next becomes curr => you pop.)
-    if curr_color and next_color and curr_color == next_color:
-        setup_cands = []
-        for hit in hits:
-            b = hit["ball"]
-            if b.get("color") != curr_color:
-                continue
-            if cluster_sizes.get(id(b), 1) != 1:
-                continue
-            setup_cands.append(hit)
-        if setup_cands:
-            best = min(setup_cands, key=lambda hh: hh["t_hit"])
-            b = best["ball"]
-            return ShotPlan(
-                action="shoot",
-                aim_xy=(float(b["x"]), float(b["y"])),
-                why=f"SETUP {curr_color}→pair (next same)",
-                target=b,
-                target_key=_ball_key(b),
-            )
+    # # 2) SETUP: if current==next, grow a single into a pair for the next shot
+    # # (You shoot curr into a lone same-color ball => pair; next becomes curr => you pop.)
+    # if curr_color and next_color and curr_color == next_color:
+    #     setup_cands = []
+    #     for hit in hits:
+    #         b = hit["ball"]
+    #         if b.get("color") != curr_color:
+    #             continue
+    #         if cluster_sizes.get(id(b), 1) != 1:
+    #             continue
+    #         setup_cands.append(hit)
+    #     if setup_cands:
+    #         best = min(setup_cands, key=lambda hh: hh["t_hit"])
+    #         b = best["ball"]
+    #         return ShotPlan(
+    #             action="shoot",
+    #             aim_xy=(float(b["x"]), float(b["y"])),
+    #             why=f"SETUP {curr_color}→pair (next same)",
+    #             target=b,
+    #             target_key=_ball_key(b),
+    #         )
 
     # 3) NEXT POP SOON: if next ball has an immediate pop, dump current as safely as possible
-    if next_color and next_color != curr_color:
-        best_next = best_hit_for_color(next_color, require_cluster_ge=2)
-        if best_next is not None:
-            ang = find_empty_angle(origin_ball, track_balls, step_deg=step_deg)
-            rad = math.radians(ang)
-            dx = math.cos(rad)
-            dy = -math.sin(rad)
-            ex, ey = _ray_end_at_border(float(origin_ball["x"]), float(origin_ball["y"]), dx, dy, w, h)
-            return ShotPlan(action="dump", aim_xy=(float(ex), float(ey)), why=f"DUMP to reach NEXT POP {next_color}")
+    # if next_color and next_color != curr_color:
+    #     best_next = best_hit_for_color(next_color, require_cluster_ge=2)
+    #     if best_next is not None:
+    #         ang = find_empty_angle(origin_ball, track_balls, step_deg=step_deg)
+    #         rad = math.radians(ang)
+    #         dx = math.cos(rad)
+    #         dy = -math.sin(rad)
+    #         ex, ey = _ray_end_at_border(float(origin_ball["x"]), float(origin_ball["y"]), dx, dy, w, h)
+    #         return ShotPlan(action="dump", aim_xy=(float(ex), float(ey)), why=f"DUMP to reach NEXT POP {next_color}")
 
     # 4) SETUP anyway: if we can't pop, at least grow a lone ball into a pair
     # (This is better than random shots; eventually you get this color again.)
@@ -574,7 +521,7 @@ def plan_best_shot(
                 target=b,
                 target_key=_ball_key(b),
             )
-
+    print("empty")
     # 5) DUMP: shoot into empty space (or the farthest first-hit ray)
     ang = find_empty_angle(origin_ball, track_balls, step_deg=step_deg)
     rad = math.radians(ang)
@@ -648,7 +595,13 @@ def RunCapture() -> None:
     if SHOW_ANCHOR_DEBUG:
         cv2.namedWindow(ANCHOR_WINDOW, cv2.WINDOW_NORMAL)
 
-    det = FeatureWindowDetector("../../assets/templates/anchor.png")
+    # det = FeatureWindowDetector("../../assets/templates/level2.png")
+    det = MultiLevelWindowDetector([
+    ("level1", "../../assets/templates/level1.png"),
+    ("level2", "../../assets/templates/level2.png"),
+    ("level3", "../../assets/templates/level3.png"),
+    ("level4", "../../assets/templates/level4.png"),
+])
 
     with mss.mss() as sct:
         mon = sct.monitors[1]
